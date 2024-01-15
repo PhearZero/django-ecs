@@ -1,0 +1,228 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Docker Cluster
+Parameters:
+  Environment:
+    Type: String
+    AllowedValues:
+      - latest
+      - beta
+      - main
+      - develop
+  VPC:
+    Type: AWS::EC2::VPC::Id
+    Description: Select the VPC
+  VPCSubnets:
+    Type: List<AWS::EC2::Subnet::Id>
+  GitHubUsername:
+    Type: String
+  GitHubPAT:
+    Type: String
+    NoEcho: true
+  MasterUsername:
+    Type: String
+  MasterUserPassword:
+    Type: String
+    NoEcho: true
+  MinCapacity:
+    Type: String
+  MaxCapacity:
+    Type: String
+Resources:
+# TODO: Add application secretes
+#  AppSecret:
+#    Type: AWS::SecretsManager::Secret
+#    Properties:
+#      Description: GitHub Container Login
+#      Name: !Sub ${AWS::StackName}-ghcr-login
+#      SecretString: !Sub "{ \"username\": \"${GitHubUsername}\", \"password\": \"${GitHubPAT}\" }"
+
+  GHCRSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: GitHub Container Login
+      Name: !Sub ${AWS::StackName}-ghcr-login
+      SecretString: !Sub "{ \"username\": \"${GitHubUsername}\", \"password\": \"${GitHubPAT}\" }"
+  ApplicationTask:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      NetworkMode: awsvpc
+      Cpu: 256
+      Memory: 512
+      RequiresCompatibilities:
+        - FARGATE
+      Family: !Sub ${AWS::StackName}-http-handler
+      ContainerDefinitions:
+        - Name: http-handler
+          Image: !Sub ghcr.io/phearzero/django-ecs:${Environment}
+          RepositoryCredentials: !Ref GHCRSecret
+          # TODO: Secrets:
+          PortMappings:
+            - ContainerPort: 80
+              Protocol: tcp
+          Essential: true
+          Environment:
+            - Name: DB_HOST
+              Value: !GetAtt DBInstance.Endpoint.Address
+            - Name: REDIS_HOST
+              Value: !GetAtt RedisCluster.Endpoint.Address
+    DependsOn:
+      - RedisCluster
+      - DBInstance
+  NginxTask:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      NetworkMode: awsvpc
+      Cpu: 256
+      Memory: 512
+      RequiresCompatibilities:
+        - FARGATE
+      Family: !Sub ${AWS::StackName}-nginx
+      ContainerDefinitions:
+        - Name: nginx
+          Image: !Sub nginx:${Environment}
+          PortMappings:
+            - ContainerPort: 80
+              Protocol: tcp
+          Essential: true
+          Environment:
+            - Name: DB_HOST
+              Value: !GetAtt DBInstance.Endpoint.Address
+            - Name: REDIS_HOST
+              Value: !GetAtt RedisCluster.Endpoint.Address
+    DependsOn:
+      - RedisCluster
+      - DBInstance
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub ${AWS::StackName}-cluster
+      CapacityProviders:
+        - FARGATE
+        - FARGATE_SPOT
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+      Configuration:
+        ExecuteCommandConfiguration:
+          Logging: DEFAULT
+      ServiceConnectDefaults:
+        Namespace: ECSClusterNamespace
+
+  ECSService:
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref NginxTask
+      LaunchType: FARGATE
+      ServiceName: !Sub ${AWS::StackName}-nginx-service
+      SchedulingStrategy: REPLICA
+      DesiredCount: 2
+      LoadBalancers:
+        - ContainerName: nginx
+          ContainerPort: 80
+          TargetGroupArn:
+            Ref: TargetGroup
+      HealthCheckGracePeriodSeconds: '10'
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          SecurityGroups:
+            - Ref: SecurityGroup
+          Subnets: !Ref VPCSubnets
+      PlatformVersion: LATEST
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 100
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      DeploymentController:
+        Type: ECS
+      ServiceConnectConfiguration:
+        Enabled: false
+      Tags: []
+      EnableECSManagedTags: true
+    DependsOn:
+      - Listener
+
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub SecurityGroup for ${AWS::StackName}
+      GroupName: !Sub ${AWS::StackName}-sg
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - FromPort: 80
+          ToPort: 80
+          IpProtocol: tcp
+          CidrIp: 0.0.0.0/0
+        - FromPort: 80
+          ToPort: 80
+          IpProtocol: tcp
+          CidrIpv6: "::/0"
+
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Type: application
+      Name: !Sub ${AWS::StackName}-lb
+      SecurityGroups:
+        - Ref: SecurityGroup
+      Subnets: !Ref VPCSubnets
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckPath: "/"
+      Name: !Sub ${AWS::StackName}-tg
+      Port: 80
+      Protocol: HTTP
+      TargetType: ip
+      HealthCheckProtocol: HTTP
+      VpcId: !Ref VPC
+
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn:
+            Ref: TargetGroup
+      LoadBalancerArn:
+        Ref: LoadBalancer
+      Port: 80
+      Protocol: HTTP
+  RedisCluster:
+    Type: AWS::ElastiCache::ServerlessCache
+    Properties:
+      ServerlessCacheName: !Sub ${AWS::StackName}-cache
+      Engine: redis
+      MajorEngineVersion: 7
+  DBCluster:
+    Type: 'AWS::RDS::DBCluster'
+    Properties:
+      Engine: aurora-postgresql
+      DBClusterIdentifier: !Sub ${AWS::StackName}-db-cluster
+      EngineVersion: 15.5
+      MasterUsername: !Ref MasterUsername
+      MasterUserPassword: !Ref MasterUserPassword
+      ServerlessV2ScalingConfiguration:
+        MinCapacity: !Ref MinCapacity
+        MaxCapacity: !Ref MaxCapacity
+  DBInstance:
+    Type: 'AWS::RDS::DBInstance'
+    Properties:
+      Engine: aurora-postgresql
+      DBInstanceClass: db.serverless
+      DBClusterIdentifier: !Ref DBCluster
+
+Outputs:
+  Endpoint:
+    Description: Public services endpoint
+    Value: !GetAtt LoadBalancer.DNSName
+  Redis:
+    Description: Cache Endpoint
+    Value: !GetAtt RedisCluster.Endpoint.Address
+  Database:
+    Description: Database Endpoint
+    Value: !GetAtt DBInstance.Endpoint.Address

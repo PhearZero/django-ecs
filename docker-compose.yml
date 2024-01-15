@@ -1,0 +1,77 @@
+version: "3.4"
+
+services:
+  app:
+    deploy:
+      replicas: 4
+    image: django-ecs
+    build:
+      context: .
+    environment:
+      - VIRTUAL_HOST=localhost
+      - POSTGRES_HOST=172.17.0.1
+      - REDIS_HOST=172.17.0.1
+      - DEBUG=True
+    env_file:
+      - .env
+    ports:
+      - "8080-8090:80"
+      - "8000-8010:8000"
+    volumes:
+      - "static:/var/django/.static"
+      - "media:/var/django/.media"
+    healthcheck:
+      test: ["CMD-SHELL", "curl localhost:80"]
+      interval: 1m
+      timeout: 30s
+      retries: 10
+      start_period: 40s
+    restart: unless-stopped
+  worker:
+    deploy:
+      replicas: 4
+    image: django-ecs
+    environment:
+      - POSTGRES_HOST=172.17.0.1
+      - REDIS_HOST=172.17.0.1
+      - DEBUG=True
+    entrypoint: "celery"
+    command: "-A app worker"
+    healthcheck:
+      test: [ "CMD-SHELL", "celery -A app status | grep OK || exit 1" ]
+      interval: 1m
+      timeout: 30s
+      retries: 10
+      start_period: 40s
+  scheduler:
+    deploy:
+      replicas: 4
+    image: django-ecs
+    environment:
+      - POSTGRES_HOST=172.17.0.1
+      - REDIS_HOST=172.17.0.1
+      - DEBUG=True
+    entrypoint: "celery"
+    command: "-A app beat --scheduler redbeat.RedBeatScheduler"
+    healthcheck:
+      test: ["CMD-SHELL", "ps aux | grep -i '[c]elery -A algorand beat' || exit 1"]
+      interval: 1m
+      timeout: 30s
+      retries: 10
+      start_period: 40s
+  manage.py:
+    container_name: manage
+    deploy:
+      replicas: 0
+    image: django-ecs
+    environment:
+      - POSTGRES_HOST=172.17.0.1
+    env_file:
+      - .env
+    entrypoint: "./manage.py"
+    volumes:
+      - "static:/var/django/.static"
+      - "media:/var/django/.media"
+volumes:
+  static:
+  media:
